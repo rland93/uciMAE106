@@ -3,6 +3,27 @@
 #include <String.h>
 #include <LSM303.h>
 
+// SD Card Stuff
+#include <SPI.h>
+#include <SD.h>
+
+File fd;
+const uint8_t SD_BUFFER_SIZE = 25;
+char SDfileName[] = "log.txt"; // SD library only supports up to 8.3 names
+char SDbuff[SD_BUFFER_SIZE+2] = "";  // Added two to allow a 2 char peek for EOF state
+uint8_t SDindex = 0;
+const uint8_t SDindicator = 7;
+const uint8_t SDchipSelect = 8;
+const uint8_t SDcardDetect = 9;
+enum SDstates: uint8_t { NORMAL, E, EO };
+uint8_t SDstate = NORMAL;
+bool SDalreadyBegan = false;  // SD.begin() misbehaves if not first call 
+
+bool SDcardPresent;
+// END SD Card Library
+
+
+
 // 2-Component vector class.
 class Vec2 {
     public:
@@ -88,17 +109,23 @@ LSM303 compass;
 const int pServoPin = 3;
 const int pReedSwitchPin = 4;
 const int pSolenoidPin = 2;
-const bool pPrintInfo = true;
+const int pLEDpin = 7;
+const bool pLog = true;
 // Robot Parameters
 const float eWheelbase = 9;
 const float eTrack = 9;
 const float eWheelR = 3.149606; // 80mm wheels
 const unsigned enMagnets = 4;
-const float eServoAngleDeltaMax = 5 * M_PI/180;
-const float eServoAngleMax = 45 * M_PI/180;
+const float eServoAngleDeltaMax = 10 * M_PI/180;
+const float eServoAngleMax = 90 * M_PI/180;
 unsigned ePistonLowT = 400;
 unsigned ePistonHighT = 400;
-float pKp = .45;
+float pKp = .8;
+
+// LED status 
+uint16_t LEDt1, LEDt0;
+bool LEDstatus;
+
 // Solenoid
 int vSolenoidState = LOW;
 unsigned long vTimeSolOn, vTimeSolOff;
@@ -110,24 +137,49 @@ unsigned long vMagnetPassed0, vMagnetPassed1;
 float r, dr;
 // Time vars
 unsigned long oldTime, currentTime;
-const unsigned long pLoopPeriod = 200;  // loop period, ms
+const unsigned long pLoopPeriod = 40;  // loop period, ms
 // Targets
 Vec2 target = Vec2(60, 60);
 // create a robot and place it at [0,0]
 Robot robot = Robot(eWheelbase, eTrack, eWheelR, enMagnets, eServoAngleDeltaMax, eServoAngleMax, ePistonLowT, ePistonHighT, Vec2(0.0, 0.0) );
 
-void setup() {
-    Serial.begin(9600);
+void setup() {  
+    // SD Card Setup
+    // Note: To satisfy the AVR SPI gods the SD library takes care of setting
+    // SS_PIN as an output. We don't need to.
+    pinMode(SDcardDetect, INPUT);
+
+    // if sd card is not present we set flag
+    if(SD.begin(SDchipSelect)) {
+        SDcardPresent = true;
+    }
+    else {
+        SDcardPresent = false;
+    }
+
+    // set LED pin
+    pinMode(pLEDpin, OUTPUT);
+
+    if (pLog) {
+        // write data column labels to data file
+        File dataFile = SD.open(SDfileName, FILE_WRITE);
+        if (dataFile) {
+            dataFile.println(String("time\tR.T.A.\tS.A.T.\tS.A.\tcurPos\ttargPos\theading"));
+            dataFile.close();
+        }
+    }
     // initialize Servo
     servo.attach(3); 
-    testServo(servo, 0, 90, false, 2000);
     // initialize Compass
     Wire.begin();
     compass.init();
     compass.enableDefault();
     compass.writeReg(0x24, 0x74);
-    compass.m_min = (LSM303::vector<int16_t>){-32767, -32767, -32767};
-    compass.m_max = (LSM303::vector<int16_t>){+32767, +32767, +32767};
+    // Calibrated by ms on 2/25
+    //                                  min: { -2448,  -2456,  -1208}    
+    //                                  max: { +1959,  +2412,  +3001}
+    compass.m_min = (LSM303::vector<int16_t>){ -2448,  -2456,  -1208};
+    compass.m_max = (LSM303::vector<int16_t>){ +1959,  +2412,  +3001};
     // initialize reed switch
     pinMode(pReedSwitchPin, INPUT_PULLUP);
     currentTime = oldTime;
@@ -135,9 +187,22 @@ void setup() {
 
 void loop() {
     currentTime = millis();
+
+
+    // SD card indicator Light:
+    // SD card absent - constant light
+    // SD card present and logging - fast blink
+    // SD card present and no logging - slow blink
+    if (SDcardPresent && pLog) ledIndicate(currentTime, 75, 75, pLEDpin);
+    else if (SDcardPresent && !pLog) ledIndicate(currentTime, 75, 575, pLEDpin);
+    else digitalWrite(pLEDpin, HIGH);
+
+
     // activate the piston
     vSolenoidState = actuatePiston(currentTime, vTimeSolOn, vTimeSolOff);
     digitalWrite(pSolenoidPin, vSolenoidState);  
+
+
     // find distance traveled from veh. speed.
     vSwitchStateLast = vSwitchState;
     vSwitchState = digitalRead(pReedSwitchPin);
@@ -150,86 +215,84 @@ void loop() {
             // total dist traveled
             r += .5 * M_PI_2 * robot.wheelR;
     }    
+
+
     // Control loop
     if( (currentTime - oldTime) >= pLoopPeriod) {
+
         // update the current heading
         compass.read();
-        robot.vCurrentHeading = compass.heading() * M_PI/180;
+        float headingDegrees = compass.heading();
+        robot.vCurrentHeading = headingDegrees * M_PI/180;
+
+
         // update the robot position
         robot.vCurrentPosition = robot.vCurrentPosition + Vec2(dr, robot.vCurrentHeading).rtheta_to_xy();
         dr = 0;
-        if(pPrintInfo) Serial.print(String("p:\t" + robot.vCurrentPosition.info() + "\t"));
-        // update the servo angle
-        updateServo(target, servo, robot, pKp, pPrintInfo);
-        if(pPrintInfo) Serial.print(String("h:\t" + String(robot.vCurrentHeading) + "\ta:\t" + String(servo.read()) + "\n"));
+
+        // open the file
+        File dataFile = SD.open(SDfileName, FILE_WRITE);
+
+        // update the servo angle and get info
+        // controlInfo --> robot to target angle, servo angle target, servo angle
+        String controlInfo;
+        controlInfo = updateServo(target, servo, robot, pKp);
+
+        // only write file if we're logging
+        if (pLog) {
+            // position, target position, heading
+            String positionInfo = String(robot.vCurrentPosition.info() + "\t" + target.info() + "\t" + String(headingDegrees));
+            // write all info to datafile and then close the file
+            if (dataFile) {
+                dataFile.println(String(currentTime) + "\t" + controlInfo + positionInfo);
+                dataFile.close();
+            }
+        }
         oldTime = currentTime;
     }
-}
-
-// A function to test servo travel.
-void testServo(Servo &servo, const int low, const int hig, const bool detailed, const unsigned long period) {
-    int servoAngle;
-    bool steppingUp;
-    Serial.print("Servo test started...\n");
-    int iterations = int(float(period)/20.0);
-    for(int t = 0; t < iterations; t++) {
-        bool steppingUp;
-        if(servoAngle <= low) steppingUp = true;
-        if(servoAngle >= hig) steppingUp = false;
-        if(servoAngle <= hig && steppingUp == true) servoAngle++;
-        else servoAngle--;
-        servo.write(servoAngle);
-        if(detailed) Serial.print(String("Angle:\t" + String(servo.read()) + "\n"));
-        delay(20);
-    }
-    Serial.print("Servo test finished...\n");
 }
 
 // steer the servo towards the desired heading.
 // ** note. sat stands for Servo Angle Target.
 // **      dsat stands for Servo Angle Target Delta.
-void updateServo(const Vec2 &target, Servo &servo, const Robot &robot, const float Kp, const bool showinfo) {
+// returns the data of the update process in a string.
+String updateServo(const Vec2 &target, Servo &servo, const Robot &robot, const float Kp) {
     float sat, dsat, targetDist, robotToTargetAngle, servoAngle, currentServoAngle;
     Vec2 robotToTargetVector;
     robotToTargetVector = target - robot.vCurrentPosition;
     targetDist = sqrt( robotToTargetVector.mag2() );
     // position vector from robot to target
     robotToTargetAngle = wrapPi(robot.vCurrentHeading - atan2(robotToTargetVector.y, robotToTargetVector.x));
-        if(showinfo) Serial.print("\t" + String(robotToTargetAngle * 180 * M_1_PI,3) + "\t");
     // apply gain
     sat = Kp * robotToTargetAngle;
     sat = sign(sat) * min(robot.servoAngleMax, abs(sat));
-        if(showinfo) Serial.print("\t" + String(sat * 180 * M_1_PI) + "\t");
     currentServoAngle = servo.read() * M_PI/180;
     // servo needs to travel this distance
     dsat = sat - currentServoAngle;
     // servo can only turn so fast
     servoAngle = currentServoAngle + sign(dsat) * min(robot.servoAngleDeltaMax, abs(dsat));
-        if(showinfo) Serial.print("\t" + String(servoAngle * 180 * M_1_PI) + "\t");
     // make sure we don't go out of bounds
     servoAngle = sign(servoAngle) * min(robot.servoAngleMax, abs(servoAngle));
     servo.write(servoAngle * 180 / M_PI);
+    // return info
+    return String(String(robotToTargetAngle * 180 * M_1_PI,3) + "\t" + String(sat * 180 * M_1_PI) + "\t" + String(servoAngle * 180 * M_1_PI) + "\t");
 }
 
 // method for actuating piston
 int actuatePiston(const unsigned long &currentTime, unsigned long &prevTimeOn, unsigned long prevTimeOff) {
     bool pistonState;
     // if it's on we turn it off...
-    if(pistonState) {
-        if(pistonState && (currentTime - prevTimeOff) > prevTimeOn) {
-            pistonState = false;
-            prevTimeOn = currentTime;
-            return LOW;
-        }
+    if(pistonState && (currentTime - prevTimeOff) > prevTimeOn) {
+        pistonState = false;
+        prevTimeOn = currentTime;
+        return LOW;
     }
     // if it's off we turn it on...
-    else {
-        if( (currentTime - prevTimeOn) > prevTimeOff) {
-            pistonState = true;
-            prevTimeOff = currentTime;
-            return HIGH;
-        }
-    }    
+    if( (currentTime - prevTimeOn) > prevTimeOff) {
+        pistonState = true;
+        prevTimeOff = currentTime;
+        return HIGH;
+    }
 }
 
 // return -1 or 1 corresponding to sign of a number
@@ -241,4 +304,20 @@ float sign(float u) {
 float wrapPi(float u) {
     if (u > M_PI) return (u-2*M_PI);
     else return u;
+}
+
+// LED Indicator Light 
+void ledIndicate(unsigned long &time, const uint16_t LEDon, const uint16_t LEDoff, const uint8_t LEDpin) {
+    LEDt0 = (time % 65536);
+    // if it's off turn it on
+    if ( !LEDstatus && (LEDt0-LEDt1) >= LEDoff) {
+        digitalWrite(LEDpin, HIGH);
+        LEDstatus = true;
+        LEDt1 = LEDt0;
+    } 
+    if (LEDstatus && (LEDt0-LEDt1) >= LEDon) {
+    digitalWrite(LEDpin, LOW);
+    LEDstatus = false;
+    LEDt1 = LEDt0;
+    }
 }
