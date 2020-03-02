@@ -130,7 +130,7 @@ bool LEDstatus;
 int vSolenoidState = LOW;
 unsigned long vTimeSolOn, vTimeSolOff;
 // Servo
-float vservoAngle;
+float vServoAngle;
 // Switch
 bool vSwitchStateLast, vSwitchState;
 unsigned long vMagnetPassed0, vMagnetPassed1;
