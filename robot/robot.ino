@@ -1,29 +1,18 @@
-#include <Wire.h>
-#include <Servo.h>
+#include <Wire.h>       // Magnetometer
+#include <Servo.h>      // Servo
 #include <String.h>
-#include <LSM303.h>
-
-// SD Card Stuff
-#include <SPI.h>
-#include <SD.h>
-
-File fd;
-const uint8_t SD_BUFFER_SIZE = 25;
+#include <LSM303.h>     // Magnetometer
+#include <SPI.h>        // SD
+#include <SD.h>         // SD
+File logFile;
 char SDfileName[] = "log.txt"; // SD library only supports up to 8.3 names
-char SDbuff[SD_BUFFER_SIZE+2] = "";  // Added two to allow a 2 char peek for EOF state
-uint8_t SDindex = 0;
 const uint8_t SDindicator = 7;
 const uint8_t SDchipSelect = 8;
 const uint8_t SDcardDetect = 9;
 enum SDstates: uint8_t { NORMAL, E, EO };
 uint8_t SDstate = NORMAL;
 bool SDalreadyBegan = false;  // SD.begin() misbehaves if not first call 
-
 bool SDcardPresent;
-// END SD Card Library
-
-
-
 // 2-Component vector class.
 class Vec2 {
     public:
@@ -37,23 +26,23 @@ class Vec2 {
     Vec2 operator - (const Vec2 &u) const {
         return Vec2(x - u.x, y - u.y);}
     // get mag^2
-    const float mag2() {
+    const float mag2() const {
         return x*x + y*y;}
     // return [x,y] vector as r, theta.
-    Vec2 xy_to_rtheta() {
+    Vec2 xy_to_rtheta() const {
         if(x != 0.0f) return Vec2(sqrt(this->mag2()), tan(y/x));
         else return Vec2(sqrt(this->mag2()), M_PI_2);}
     // return [r,t] vector as x, y
-    Vec2 rtheta_to_xy() {
+    Vec2 rtheta_to_xy() const {
         return Vec2(x * cos(y), x * cos(y));}
     // vector cross product 
-    float cross(const Vec2 &u) {
+    float cross(const Vec2 &u) const {
         return (x * u.y - y * u.x);}
     // vector dot product
-    float dot(const Vec2 &u) {
+    float dot(const Vec2 &u) const {
         return x * u.x + y * u.y;}
     // return vector as string
-    String info() {
+    String info() const {
         return String("[" + String(x) + ", " + String(y) + "]");
     }
 };
@@ -106,10 +95,10 @@ public:
 // Hardware pins, interfaces, etc.
 Servo servo;
 LSM303 compass;
-const int pServoPin = 3;
-const int pReedSwitchPin = 4;
-const int pSolenoidPin = 2;
-const int pLEDpin = 7;
+const uint8_t pServoPin = 3;
+const uint8_t pReedSwitchPin = 4;
+const uint8_t pSolenoidPin = 2;
+const uint8_t pLEDpin = 7;
 const bool pLog = true;
 // Robot Parameters
 const float eWheelbase = 9;
@@ -121,25 +110,26 @@ const float eServoAngleMax = 90 * M_PI/180;
 unsigned ePistonLowT = 400;
 unsigned ePistonHighT = 400;
 float pKp = .8;
-
-// LED status 
+// misc
 uint16_t LEDt1, LEDt0;
 bool LEDstatus;
-
-// Solenoid
 int vSolenoidState = LOW;
 unsigned long vTimeSolOn, vTimeSolOff;
-// Servo
 float vServoAngle;
-// Switch
 bool vSwitchStateLast, vSwitchState;
 unsigned long vMagnetPassed0, vMagnetPassed1;
 float r, dr;
-// Time vars
-unsigned long oldTime, currentTime;
+unsigned long vOldTime, vCurrentTime;
 const unsigned long pLoopPeriod = 40;  // loop period, ms
-// Targets
-Vec2 target = Vec2(60, 60);
+unsigned long vbeginTime; // time that the main loop will start
+const unsigned long pMaxTime = 40000; // max time, in ms
+// List of Targets
+const uint8_t noTargets = 3; // bugs will come if this isn't equal to the len of targets[] below.
+const Vec2 targets [noTargets] = { Vec2(60, 60), Vec2(150, 100), Vec2(100, -40) };
+uint8_t vtargetIndex = 0;
+const float ptargetOKDist = 10.00;
+bool vTerminate = false;
+
 // create a robot and place it at [0,0]
 Robot robot = Robot(eWheelbase, eTrack, eWheelR, enMagnets, eServoAngleDeltaMax, eServoAngleMax, ePistonLowT, ePistonHighT, Vec2(0.0, 0.0) );
 
@@ -162,10 +152,10 @@ void setup() {
 
     if (pLog) {
         // write data column labels to data file
-        File dataFile = SD.open(SDfileName, FILE_WRITE);
-        if (dataFile) {
-            dataFile.println(String("time\tR.T.A.\tS.A.T.\tS.A.\tcurPos\ttargPos\theading"));
-            dataFile.close();
+        logFile = SD.open(SDfileName, FILE_WRITE);
+        if (logFile) {
+            logFile.println(String("time\tR.T.A.\tS.A.T.\tS.A.\tcurPos\ttargPos\theading"));
+            logFile.close();
         }
     }
     // initialize Servo
@@ -182,73 +172,76 @@ void setup() {
     compass.m_max = (LSM303::vector<int16_t>){ +1959,  +2412,  +3001};
     // initialize reed switch
     pinMode(pReedSwitchPin, INPUT_PULLUP);
-    currentTime = oldTime;
+
+    // this should always be the last entry in setup()
+    vbeginTime = vCurrentTime;
 }
 
 void loop() {
-    currentTime = millis();
+    if (not vTerminate) {
+        vCurrentTime = millis();
+        // SD card indicator Light:
+        // SD card absent - constant light
+        // SD card present and logging - fast blink
+        // SD card present and no logging - slow blink
+        if (SDcardPresent && pLog) ledIndicate(vCurrentTime, 50, 150, pLEDpin);
+        else if (SDcardPresent && !pLog) ledIndicate(vCurrentTime, 50, 950, pLEDpin);
+        else digitalWrite(pLEDpin, HIGH);
+
+        // activate the piston
+        vSolenoidState = actuatePiston(vCurrentTime, vTimeSolOn, vTimeSolOff);
+        digitalWrite(pSolenoidPin, vSolenoidState);  
+
+        // find distance traveled from veh. speed.
+        vSwitchStateLast = vSwitchState;
+        vSwitchState = digitalRead(pReedSwitchPin);
+        if(vSwitchStateLast == 1 && vSwitchState == 0) {
+                // store times for each pulse
+                vMagnetPassed1 = vMagnetPassed0;
+                vMagnetPassed0 = vCurrentTime;
+                // vehicle traveled 1/4 of wheel radius
+                dr += .5 * M_PI_2 * robot.wheelR;
+                // total dist traveled
+                r += .5 * M_PI_2 * robot.wheelR;
+        }    
 
 
-    // SD card indicator Light:
-    // SD card absent - constant light
-    // SD card present and logging - fast blink
-    // SD card present and no logging - slow blink
-    if (SDcardPresent && pLog) ledIndicate(currentTime, 75, 75, pLEDpin);
-    else if (SDcardPresent && !pLog) ledIndicate(currentTime, 75, 575, pLEDpin);
-    else digitalWrite(pLEDpin, HIGH);
+        // Control loop
+        if( (vCurrentTime - vOldTime) >= pLoopPeriod) {
 
+            // update the current heading
+            compass.read();
+            float headingDegrees = compass.heading();
+            robot.vCurrentHeading = headingDegrees * M_PI/180;
+            // update the robot position
+            robot.vCurrentPosition = robot.vCurrentPosition + Vec2(dr, robot.vCurrentHeading).rtheta_to_xy();
+            dr = 0;
+            // check distance to target, then either update target or vTerminate
+            float targetDist = (robot.vCurrentPosition - targets[vtargetIndex]).mag2();
+            if (targetDist < ptargetOKDist && vtargetIndex < noTargets) vtargetIndex ++;
+            else if (targetDist < ptargetOKDist && vtargetIndex == noTargets) vTerminate = true;
 
-    // activate the piston
-    vSolenoidState = actuatePiston(currentTime, vTimeSolOn, vTimeSolOff);
-    digitalWrite(pSolenoidPin, vSolenoidState);  
+            // update the servo angle and get info
+            // controlInfo --> robot to target angle, servo angle target, servo angle
+            String controlInfo;
+            controlInfo = updateServo(targets[vtargetIndex], servo, robot, pKp);
 
-
-    // find distance traveled from veh. speed.
-    vSwitchStateLast = vSwitchState;
-    vSwitchState = digitalRead(pReedSwitchPin);
-    if(vSwitchStateLast == 1 && vSwitchState == 0) {
-            // store times for each pulse
-            vMagnetPassed1 = vMagnetPassed0;
-            vMagnetPassed0 = currentTime;
-            // vehicle traveled 1/4 of wheel radius
-            dr += .5 * M_PI_2 * robot.wheelR;
-            // total dist traveled
-            r += .5 * M_PI_2 * robot.wheelR;
-    }    
-
-
-    // Control loop
-    if( (currentTime - oldTime) >= pLoopPeriod) {
-
-        // update the current heading
-        compass.read();
-        float headingDegrees = compass.heading();
-        robot.vCurrentHeading = headingDegrees * M_PI/180;
-
-
-        // update the robot position
-        robot.vCurrentPosition = robot.vCurrentPosition + Vec2(dr, robot.vCurrentHeading).rtheta_to_xy();
-        dr = 0;
-
-        // open the file
-        File dataFile = SD.open(SDfileName, FILE_WRITE);
-
-        // update the servo angle and get info
-        // controlInfo --> robot to target angle, servo angle target, servo angle
-        String controlInfo;
-        controlInfo = updateServo(target, servo, robot, pKp);
-
-        // only write file if we're logging
-        if (pLog) {
-            // position, target position, heading
-            String positionInfo = String(robot.vCurrentPosition.info() + "\t" + target.info() + "\t" + String(headingDegrees));
-            // write all info to datafile and then close the file
-            if (dataFile) {
-                dataFile.println(String(currentTime) + "\t" + controlInfo + positionInfo);
-                dataFile.close();
+            // only write file if we're logging
+            if (pLog) {
+                // open the file
+                logFile = SD.open(SDfileName, FILE_WRITE);
+                // position, target position, heading
+                String positionInfo = String(robot.vCurrentPosition.info() + "\t" + targets[vtargetIndex].info() + "\t" + String(headingDegrees));
+                // write all info to logFile and then close the file
+                if (logFile) {
+                    logFile.println(String(vCurrentTime) + "\t" + controlInfo + positionInfo);
+                    logFile.close();
+                }
             }
+            vOldTime = vCurrentTime;
         }
-        oldTime = currentTime;
+        // terminate if we exceed time
+        if (vCurrentTime - vbeginTime > pMaxTime) vTerminate = true;
     }
 }
 
@@ -279,18 +272,18 @@ String updateServo(const Vec2 &target, Servo &servo, const Robot &robot, const f
 }
 
 // method for actuating piston
-int actuatePiston(const unsigned long &currentTime, unsigned long &prevTimeOn, unsigned long prevTimeOff) {
+int actuatePiston(const unsigned long &vCurrentTime, unsigned long &prevTimeOn, unsigned long prevTimeOff) {
     bool pistonState;
     // if it's on we turn it off...
-    if(pistonState && (currentTime - prevTimeOff) > prevTimeOn) {
+    if(pistonState && (vCurrentTime - prevTimeOff) > prevTimeOn) {
         pistonState = false;
-        prevTimeOn = currentTime;
+        prevTimeOn = vCurrentTime;
         return LOW;
     }
     // if it's off we turn it on...
-    if( (currentTime - prevTimeOn) > prevTimeOff) {
+    if( (vCurrentTime - prevTimeOn) > prevTimeOff) {
         pistonState = true;
-        prevTimeOff = currentTime;
+        prevTimeOff = vCurrentTime;
         return HIGH;
     }
 }
